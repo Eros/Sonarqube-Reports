@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Scan a project with a local SonarQube server and write the findings to Markdown.
-
+"""
 Usage:
     python sonar_report.py [project_dir] --token squ_xxx
-    python sonar_report.py . --start-server --min-severity MEDIUM
+    python sonar_report.py . --start-server --min-severity MEDIUM          # finds a local install, else Docker
+    python sonar_report.py . --start-server --sonar-home C:\\sonarqube     # explicit local install
     python sonar_report.py . --skip-scan            # just re-export the last analysis
 """
 
@@ -74,21 +74,45 @@ def run(cmd, cwd):
     subprocess.run([str(c) for c in cmd], cwd=cwd, check=True)
 
 
-def start_server(sonar):
+def is_sonar_home(path):
+    return (path / "bin/windows-x86-64/StartSonar.bat").exists() or any((path / "bin").glob("*/sonar.sh"))
+
+
+def find_sonar_home():
+    roots = [Path(__file__).resolve().parent, Path.home(), Path.home() / "Downloads", Path.home() / "Tools"]
+    if os.name == "nt":
+        roots += [Path(os.environ[v]) for v in ("LOCALAPPDATA", "ProgramFiles") if v in os.environ]
+        for drive in "CDEFG":
+            base = Path(f"{drive}:/")
+            if base.exists():
+                roots += [base, base / "Tools", base / "Dev", base / "Dev/Tools"]
+    else:
+        roots += [Path("/opt"), Path("/usr/local")]
+
+    found = []
+    for root in roots:
+        try:
+            # Zips often extract as sonarqube-x/sonarqube-x, so look one level deeper too.
+            for candidate in [*root.glob("sonarqube*"), *root.glob("sonarqube*/sonarqube*")]:
+                if candidate.is_dir() and is_sonar_home(candidate):
+                    found.append(candidate)
+        except OSError:
+            continue
+    return max(found, key=lambda p: p.stat().st_mtime) if found else None
+
+
+def start_server(sonar, sonar_home, use_docker):
     if sonar.is_up():
         return
-    if not shutil.which("docker"):
-        sys.exit("SonarQube isn't reachable and docker isn't on PATH.")
-    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
-        sys.exit("Docker is installed but its engine isn't running. Start Docker Desktop, "
-                 "wait for it to say 'Engine running', then try again.")
-    existing = subprocess.run(["docker", "ps", "-aq", "-f", f"name=^{CONTAINER_NAME}$"],
-                              capture_output=True, text=True).stdout.strip()
-    if existing:
-        subprocess.run(["docker", "start", CONTAINER_NAME], check=True)
+    if not sonar_home and not use_docker:
+        sonar_home = find_sonar_home()
+        if sonar_home:
+            print(f"Found SonarQube install at {sonar_home}")
+    if sonar_home and not use_docker:
+        logs = start_local(Path(sonar_home).resolve())
     else:
-        subprocess.run(["docker", "run", "-d", "--name", CONTAINER_NAME, "-p", "9000:9000",
-                        "sonarqube:community"], check=True)
+        start_docker()
+        logs = f"`docker logs {CONTAINER_NAME}`"
     print("Waiting for SonarQube to come up", end="", flush=True)
     for _ in range(180):
         if sonar.is_up():
@@ -96,10 +120,50 @@ def start_server(sonar):
             return
         print(".", end="", flush=True)
         time.sleep(2)
-    sys.exit("\nSonarQube didn't start within 6 minutes; check `docker logs sonarqube-local`.")
+    sys.exit(f"\nSonarQube didn't start within 6 minutes; check {logs}.")
 
 
-def scan(project, key, host, token):
+def start_docker():
+    if not shutil.which("docker"):
+        sys.exit("SonarQube isn't reachable and docker isn't on PATH. "
+                 "Use --sonar-home to run a local SonarQube install instead.")
+    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        sys.exit("Docker is installed but its engine isn't running. Start Docker Desktop, "
+                 "or use --sonar-home to run a local SonarQube install instead.")
+    existing = subprocess.run(["docker", "ps", "-aq", "-f", f"name=^{CONTAINER_NAME}$"],
+                              capture_output=True, text=True).stdout.strip()
+    if existing:
+        subprocess.run(["docker", "start", CONTAINER_NAME], check=True)
+    else:
+        subprocess.run(["docker", "run", "-d", "--name", CONTAINER_NAME, "-p", "9000:9000",
+                        "sonarqube:community"], check=True)
+
+
+def start_local(home):
+    if not (home / "bin").is_dir():
+        sys.exit(f"{home} doesn't look like a SonarQube install (no bin folder). "
+                 "Point --sonar-home at the unzipped folder, e.g. C:\\sonarqube-25.x.")
+    if not (shutil.which("java") or os.environ.get("SONAR_JAVA_PATH") or os.environ.get("JAVA_HOME")):
+        sys.exit("SonarQube needs Java 17 or 21 on PATH (or JAVA_HOME / SONAR_JAVA_PATH set).")
+
+    if os.name == "nt":
+        script = home / "bin/windows-x86-64/StartSonar.bat"
+        if not script.exists():
+            sys.exit(f"Couldn't find {script}.")
+        # StartSonar.bat runs in the foreground, so give it its own window; close that window to stop the server.
+        subprocess.Popen(["cmd", "/c", str(script)], cwd=script.parent,
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        scripts = list((home / "bin").glob("*/sonar.sh"))
+        if not scripts:
+            sys.exit(f"Couldn't find bin/<platform>/sonar.sh under {home}.")
+        platform_dir = "macosx" if sys.platform == "darwin" else "linux"
+        script = next((s for s in scripts if s.parent.name.startswith(platform_dir)), scripts[0])
+        subprocess.run([str(script), "start"], check=True)
+    return home / "logs"
+
+
+def scan(project, key, host, token, build_args=(), ignore_build_errors=False):
     props = {"sonar.projectKey": key, "sonar.host.url": host, "sonar.token": token}
 
     gradle_files = [project / f for f in ("build.gradle", "build.gradle.kts")]
@@ -144,7 +208,13 @@ def scan(project, key, host, token):
         scanner = [shutil.which("dotnet-sonarscanner")] if shutil.which("dotnet-sonarscanner") \
             else ["dotnet", "sonarscanner"]
         run([*scanner, "begin", f"/k:{key}", f"/d:sonar.host.url={host}", f"/d:sonar.token={token}"], project)
-        run(["dotnet", "build", solutions[0], "--no-incremental"], project)
+        try:
+            run(["dotnet", "build", solutions[0], "--no-incremental", *build_args], project)
+        except subprocess.CalledProcessError:
+            if not ignore_build_errors:
+                raise
+            print("Build failed; continuing because of --ignore-build-errors. "
+                  "Projects that didn't compile will be missing from the report.")
         run([*scanner, "end", f"/d:sonar.token={token}"], project)
         return
 
@@ -314,7 +384,14 @@ def main():
     ap.add_argument("--out", default="sonar-report.md")
     ap.add_argument("--min-severity", default="INFO", type=str.upper, choices=sorted(SEVERITY_RANK))
     ap.add_argument("--skip-scan", action="store_true", help="only export the latest analysis")
-    ap.add_argument("--start-server", action="store_true", help="start a local SonarQube container if needed")
+    ap.add_argument("--start-server", action="store_true",
+                    help="start SonarQube if it isn't running (a local install if one is found, else Docker)")
+    ap.add_argument("--sonar-home", default=os.environ.get("SONAR_HOME"),
+                    help="unzipped SonarQube install to run (or SONAR_HOME env); auto-detected if omitted")
+    ap.add_argument("--docker", action="store_true", help="use Docker even if a local install is found")
+    ap.add_argument("--build-args", default="", help='extra args for dotnet build, e.g. "-c Release"')
+    ap.add_argument("--ignore-build-errors", action="store_true",
+                    help=".NET only: still finish the analysis if the build fails after compiling")
     args = ap.parse_args()
 
     project = Path(args.project).resolve()
@@ -322,9 +399,10 @@ def main():
     sonar = Sonar(args.host, args.token)
 
     if args.start_server:
-        start_server(sonar)
+        start_server(sonar, args.sonar_home, args.docker)
     elif not sonar.is_up():
-        sys.exit(f"SonarQube isn't reachable at {args.host} (use --start-server to launch it in Docker).")
+        sys.exit(f"SonarQube isn't reachable at {args.host}. Start it yourself, or use --start-server "
+                 "(with --sonar-home for a local install, otherwise Docker).")
 
     if not args.token:
         sys.exit("No token. Log in at the server (admin/admin on first run), create one under "
@@ -332,7 +410,12 @@ def main():
 
     if not args.skip_scan:
         started = time.time()
-        scan(project, key, args.host, args.token)
+        try:
+            scan(project, key, args.host, args.token, args.build_args.split(), args.ignore_build_errors)
+        except subprocess.CalledProcessError as e:
+            hint = "" if args.ignore_build_errors else \
+                " If the code compiled and only a later step failed (e.g. a deploy/copy), try --ignore-build-errors."
+            sys.exit(f"\nScan step failed (exit {e.returncode}): {' '.join(e.cmd)}.{hint}")
         report_task = find_report_task(project, started)
         if report_task:
             wait_for_processing(sonar, report_task)
